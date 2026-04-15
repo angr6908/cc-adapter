@@ -1,6 +1,6 @@
 # cc-adapter
 
-Anthropic-to-GPT (OpenAI API) adapter for Claude Code, featuring a standalone Go binary experience.
+GPT (OpenAI API) adapter for Claude Code, featuring a standalone Go binary experience.
 
 ## Support
 - Upstream Model (e.g. gpt-5.4)
