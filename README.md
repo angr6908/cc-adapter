@@ -7,8 +7,9 @@ Anthropic-to-GPT (OpenAI API) adapter for Claude Code, featuring a standalone Go
 - Reasoning Effort (e.g. xhigh)
 - Fast Mode (true/false)
 - Context Window (e.g. 1000000)
-- Prompt Caching (enabled by default)
+- Advanced Prompt Caching (enabled by default)
 - High-Efficiency Streaming and SSE (enabled by default)
+- Session Retention (enabled by default)
 
 ## Config
 
