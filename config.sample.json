@@ -1,0 +1,11 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": "4000",
+  "local_auth_token": "replace-with-your-local-auth-token",
+  "upstream_base_url": "https://example.com",
+  "upstream_token": "replace-with-your-upstream-token",
+  "fast_mode": true,
+  "reasoning_effort": "xhigh",
+  "context_window_length": 1000000,
+  "upstream_model": "gpt-5.4"
+}
