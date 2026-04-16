@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -28,6 +29,7 @@ type runtimeConfig struct {
 	LocalAuthToken      string `json:"local_auth_token"`
 	UpstreamBaseURL     string `json:"upstream_base_url"`
 	UpstreamToken       string `json:"upstream_token"`
+	UpstreamGzip        bool   `json:"upstream_gzip"`
 	FastMode            bool   `json:"fast_mode"`
 	ServiceTier         string `json:"service_tier"`
 	ReasoningEffort     string `json:"reasoning_effort"`
@@ -43,6 +45,7 @@ type fileConfig struct {
 	LocalAuthToken      string `json:"local_auth_token"`
 	UpstreamBaseURL     string `json:"upstream_base_url"`
 	UpstreamToken       string `json:"upstream_token"`
+	UpstreamGzip        *bool  `json:"upstream_gzip,omitempty"`
 	FastMode            *bool  `json:"fast_mode,omitempty"`
 	Fastmode            *bool  `json:"fastmode,omitempty"`
 	ReasoningEffort     string `json:"reasoning_effort"`
@@ -80,6 +83,11 @@ type statePersistence struct {
 	maxAge     time.Duration
 }
 
+type upstreamGzipSupport struct {
+	mu          sync.RWMutex
+	unsupported map[string]struct{}
+}
+
 func (s *sessionStore) Get(key string) (sessionState, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -98,6 +106,31 @@ func (s *sessionStore) Replace(values map[string]sessionState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data = values
+}
+
+func (s *upstreamGzipSupport) Allowed(key string, configured bool) bool {
+	if !configured {
+		return false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, unsupported := s.unsupported[key]
+	return !unsupported
+}
+
+func (s *upstreamGzipSupport) MarkUnsupported(key string) bool {
+	if strings.TrimSpace(key) == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.unsupported[key]; exists {
+		return false
+	}
+	s.unsupported[key] = struct{}{}
+	return true
 }
 
 func (s *sessionStore) Snapshot() map[string]sessionState {
@@ -145,6 +178,7 @@ var persistedState = &statePersistence{
 	maxEntries: 1024,
 	maxAge:     24 * time.Hour,
 }
+var gzipSupport = &upstreamGzipSupport{unsupported: map[string]struct{}{}}
 var responsesHTTPClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -266,6 +300,7 @@ func loadRuntimeConfig() (*runtimeConfig, error) {
 	}
 
 	envFastMode := lookupBoolEnv("CLAUDE_PROXY_FAST_MODE")
+	envUpstreamGzip := lookupBoolEnv("CLAUDE_PROXY_UPSTREAM_GZIP")
 	fileFastMode := firstConfiguredBool(fileCfg.FastMode, fileCfg.Fastmode)
 	serviceTier := "priority"
 	switch {
@@ -283,6 +318,7 @@ func loadRuntimeConfig() (*runtimeConfig, error) {
 		LocalAuthToken:      firstNonEmpty(os.Getenv("CLAUDE_PROXY_LOCAL_AUTH_TOKEN"), fileCfg.LocalAuthToken, ""),
 		UpstreamBaseURL:     strings.TrimRight(firstNonEmpty(os.Getenv("CLAUDE_PROXY_UPSTREAM_BASE_URL"), fileCfg.UpstreamBaseURL, ""), "/"),
 		UpstreamToken:       firstNonEmpty(os.Getenv("CLAUDE_PROXY_UPSTREAM_TOKEN"), fileCfg.UpstreamToken, ""),
+		UpstreamGzip:        valueOrDefaultBool(envUpstreamGzip, fileCfg.UpstreamGzip),
 		FastMode:            isFastModeServiceTier(serviceTier),
 		ServiceTier:         serviceTier,
 		ReasoningEffort:     configuredReasoningEffort(firstNonEmpty(os.Getenv("CLAUDE_PROXY_REASONING_EFFORT"), fileCfg.ReasoningEffort, "xhigh")),
@@ -538,6 +574,15 @@ func firstConfiguredBool(values ...*bool) *bool {
 	return nil
 }
 
+func valueOrDefaultBool(values ...*bool) bool {
+	for _, value := range values {
+		if value != nil {
+			return *value
+		}
+	}
+	return false
+}
+
 func lookupBoolEnv(key string) *bool {
 	rawValue, ok := os.LookupEnv(key)
 	if !ok {
@@ -661,6 +706,11 @@ type upstreamRequest struct {
 	ReuseMode             string
 	EstimatedInput        int
 	CachedInputTokens     int
+	MessagesJSONBytes     int
+	InputJSONBytes        int
+	PrimaryBodyBytes      int
+	FallbackBodyBytes     int
+	BodyEncoding          string
 }
 
 func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]any) (*upstreamRequest, error) {
@@ -721,6 +771,27 @@ func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]a
 	}
 	fallback := cloneMap(primary)
 	delete(fallback, "service_tier")
+	messagesJSONBytes, err := jsonSizeBytes(messages)
+	if err != nil {
+		return nil, err
+	}
+	inputJSONBytes, err := jsonSizeBytes(input)
+	if err != nil {
+		return nil, err
+	}
+	useGzip := gzipSupport.Allowed(cfg.UpstreamBaseURL, cfg.UpstreamGzip)
+	primaryBodyBytes, err := requestBodyBytes(primary, useGzip)
+	if err != nil {
+		return nil, err
+	}
+	fallbackBodyBytes, err := requestBodyBytes(fallback, useGzip)
+	if err != nil {
+		return nil, err
+	}
+	bodyEncoding := "json"
+	if useGzip {
+		bodyEncoding = "gzip"
+	}
 
 	return &upstreamRequest{
 		Primary:               primary,
@@ -738,6 +809,11 @@ func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]a
 		ReuseMode:             reuseMode,
 		EstimatedInput:        estimateStaticInputTokens(systemText, tools, textConfig) + totalMessageTokens,
 		CachedInputTokens:     cachedInputTokens,
+		MessagesJSONBytes:     messagesJSONBytes,
+		InputJSONBytes:        inputJSONBytes,
+		PrimaryBodyBytes:      primaryBodyBytes,
+		FallbackBodyBytes:     fallbackBodyBytes,
+		BodyEncoding:          bodyEncoding,
 	}, nil
 }
 
@@ -765,8 +841,9 @@ func sendUpstream(ctx context.Context, cfg *runtimeConfig, req *upstreamRequest)
 	}
 
 	var lastErr error
+	useGzip := gzipSupport.Allowed(cfg.UpstreamBaseURL, cfg.UpstreamGzip)
 	for _, attempt := range tryList {
-		result, err := performResponsesRequest(ctx, attempt.url, attempt.payload, headers)
+		result, err := performResponsesRequest(ctx, attempt.url, attempt.payload, headers, &useGzip, cfg.UpstreamBaseURL)
 		if err == nil {
 			return result, nil
 		}
@@ -782,8 +859,8 @@ func upstreamResponsesURL(base string) string {
 	return base + "/v1/responses"
 }
 
-func performResponsesRequest(ctx context.Context, url string, payload map[string]any, headers http.Header) (map[string]any, error) {
-	response, err := openResponsesRequest(ctx, url, payload, headers)
+func performResponsesRequest(ctx context.Context, url string, payload map[string]any, headers http.Header, useGzip *bool, gzipKey string) (map[string]any, error) {
+	response, err := openResponsesRequestWithFallback(ctx, url, payload, headers, useGzip, gzipKey)
 	if err != nil {
 		return nil, err
 	}
@@ -792,8 +869,26 @@ func performResponsesRequest(ctx context.Context, url string, payload map[string
 	return collectResponses(response.Body)
 }
 
-func openResponsesRequest(ctx context.Context, url string, payload map[string]any, headers http.Header) (*http.Response, error) {
-	bodyBytes, err := json.Marshal(payload)
+func openResponsesRequestWithFallback(ctx context.Context, url string, payload map[string]any, headers http.Header, useGzip *bool, gzipKey string) (*http.Response, error) {
+	if useGzip != nil && *useGzip {
+		response, err := openResponsesRequest(ctx, url, payload, headers, true)
+		if err == nil {
+			return response, nil
+		}
+		if !shouldRetryPlainAfterGzip(err) {
+			return nil, err
+		}
+		if gzipSupport.MarkUnsupported(gzipKey) {
+			log.Printf("upstream gzip rejected, disabling gzip for %s until restart: %v", shortID(gzipKey), err)
+		}
+		*useGzip = false
+	}
+
+	return openResponsesRequest(ctx, url, payload, headers, false)
+}
+
+func openResponsesRequest(ctx context.Context, url string, payload map[string]any, headers http.Header, useGzip bool) (*http.Response, error) {
+	bodyBytes, err := marshalRequestBody(payload, useGzip)
 	if err != nil {
 		return nil, err
 	}
@@ -803,6 +898,9 @@ func openResponsesRequest(ctx context.Context, url string, payload map[string]an
 		return nil, err
 	}
 	request.Header = headers.Clone()
+	if useGzip {
+		request.Header.Set("Content-Encoding", "gzip")
+	}
 
 	response, err := responsesHTTPClient.Do(request)
 	if err != nil {
@@ -812,10 +910,75 @@ func openResponsesRequest(ctx context.Context, url string, payload map[string]an
 	if response.StatusCode >= 400 {
 		raw, _ := io.ReadAll(response.Body)
 		_ = response.Body.Close()
-		return nil, fmt.Errorf("upstream %d: %s", response.StatusCode, string(raw))
+		return nil, &upstreamHTTPError{StatusCode: response.StatusCode, Body: string(raw)}
 	}
 
 	return response, nil
+}
+
+type upstreamHTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *upstreamHTTPError) Error() string {
+	return fmt.Sprintf("upstream %d: %s", e.StatusCode, e.Body)
+}
+
+func marshalRequestBody(payload map[string]any, useGzip bool) ([]byte, error) {
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	if !useGzip {
+		return bodyBytes, nil
+	}
+
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(bodyBytes); err != nil {
+		_ = writer.Close()
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return compressed.Bytes(), nil
+}
+
+func jsonSizeBytes(value any) (int, error) {
+	bodyBytes, err := json.Marshal(value)
+	if err != nil {
+		return 0, err
+	}
+	return len(bodyBytes), nil
+}
+
+func requestBodyBytes(payload map[string]any, useGzip bool) (int, error) {
+	bodyBytes, err := marshalRequestBody(payload, useGzip)
+	if err != nil {
+		return 0, err
+	}
+	return len(bodyBytes), nil
+}
+
+func shouldRetryPlainAfterGzip(err error) bool {
+	var upstreamErr *upstreamHTTPError
+	if !errors.As(err, &upstreamErr) {
+		return false
+	}
+	if upstreamErr.StatusCode == http.StatusUnsupportedMediaType {
+		return true
+	}
+	if upstreamErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+
+	body := strings.ToLower(strings.TrimSpace(upstreamErr.Body))
+	return strings.Contains(body, "failed to parse request body") ||
+		strings.Contains(body, "content-encoding") ||
+		strings.Contains(body, "unsupported encoding") ||
+		strings.Contains(body, "unsupported media type")
 }
 
 func collectResponses(body io.Reader) (map[string]any, error) {
@@ -890,8 +1053,9 @@ func streamUpstreamToAnthropic(ctx context.Context, cfg *runtimeConfig, req *ups
 	}
 
 	var lastErr error
+	useGzip := gzipSupport.Allowed(cfg.UpstreamBaseURL, cfg.UpstreamGzip)
 	for _, attempt := range tryList {
-		response, err := openResponsesRequest(ctx, attempt.url, attempt.payload, headers)
+		response, err := openResponsesRequestWithFallback(ctx, attempt.url, attempt.payload, headers, &useGzip, cfg.UpstreamBaseURL)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1758,8 +1922,12 @@ func logTurnStart(mode, requestedModel string, req *upstreamRequest) {
 	if req == nil {
 		return
 	}
+	bodyLabel := "raw"
+	if req.BodyEncoding == "gzip" {
+		bodyLabel = "compressed"
+	}
 	log.Printf(
-		"turn_start mode=%s model=%s session=%s synthetic=%t prompt_cache=%s reuse=%s messages=%d appended=%d prev_response=%s estimated_input=%d cached_input=%d",
+		"turn_start mode=%s model=%s session=%s synthetic=%t prompt_cache=%s reuse=%s messages=%d appended=%d prev_response=%s estimated_input=%d cached_input=%d %s=%s",
 		mode,
 		requestedModel,
 		shortID(req.SessionID),
@@ -1771,6 +1939,8 @@ func logTurnStart(mode, requestedModel string, req *upstreamRequest) {
 		shortID(req.PreviousResponseID),
 		req.EstimatedInput,
 		req.CachedInputTokens,
+		bodyLabel,
+		byteSizeLabel(req.PrimaryBodyBytes),
 	)
 }
 
@@ -1877,6 +2047,23 @@ func upstreamStreamError(event map[string]any) error {
 
 func approximateTokens(payload any) int {
 	return len(stableJSON(payload)) / 4
+}
+
+func byteSizeLabel(size int) string {
+	if size < 1024 {
+		return fmt.Sprintf("%.2fKB", float64(size)/1024)
+	}
+
+	value := float64(size)
+	units := []string{"KB", "MB", "GB"}
+	for _, unit := range units {
+		value /= 1024
+		if value < 1024 || unit == units[len(units)-1] {
+			return fmt.Sprintf("%.2f%s", value, unit)
+		}
+	}
+
+	return fmt.Sprintf("%.2fGB", float64(size)/(1024*1024*1024))
 }
 
 func estimateStaticInputTokens(instructions string, tools []any, textConfig map[string]any) int {
