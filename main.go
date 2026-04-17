@@ -682,7 +682,10 @@ func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]a
 		"model":            cfg.Model,
 		"input":            input,
 		"reasoning":        reasoning,
-		"stream":           boolValue(body["stream"], true),
+		// The adapter always consumes the upstream Responses API as SSE.
+		// Even for Claude's sync mode, we collect the SSE stream and return a
+		// final JSON message after response.completed arrives.
+		"stream":           true,
 		"prompt_cache_key": promptCacheKey,
 	}
 	if cfg.ServiceTier != "" {
