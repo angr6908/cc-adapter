@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -29,7 +28,6 @@ type runtimeConfig struct {
 	LocalAuthToken      string `json:"local_auth_token"`
 	UpstreamBaseURL     string `json:"upstream_base_url"`
 	UpstreamToken       string `json:"upstream_token"`
-	UpstreamGzip        bool   `json:"upstream_gzip"`
 	FastMode            bool   `json:"fast_mode"`
 	ServiceTier         string `json:"service_tier"`
 	ReasoningEffort     string `json:"reasoning_effort"`
@@ -45,7 +43,6 @@ type fileConfig struct {
 	LocalAuthToken      string `json:"local_auth_token"`
 	UpstreamBaseURL     string `json:"upstream_base_url"`
 	UpstreamToken       string `json:"upstream_token"`
-	UpstreamGzip        *bool  `json:"upstream_gzip,omitempty"`
 	FastMode            *bool  `json:"fast_mode,omitempty"`
 	Fastmode            *bool  `json:"fastmode,omitempty"`
 	ReasoningEffort     string `json:"reasoning_effort"`
@@ -83,11 +80,6 @@ type statePersistence struct {
 	maxAge     time.Duration
 }
 
-type upstreamGzipSupport struct {
-	mu          sync.RWMutex
-	unsupported map[string]struct{}
-}
-
 func (s *sessionStore) Get(key string) (sessionState, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -106,31 +98,6 @@ func (s *sessionStore) Replace(values map[string]sessionState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data = values
-}
-
-func (s *upstreamGzipSupport) Allowed(key string, configured bool) bool {
-	if !configured {
-		return false
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, unsupported := s.unsupported[key]
-	return !unsupported
-}
-
-func (s *upstreamGzipSupport) MarkUnsupported(key string) bool {
-	if strings.TrimSpace(key) == "" {
-		return false
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.unsupported[key]; exists {
-		return false
-	}
-	s.unsupported[key] = struct{}{}
-	return true
 }
 
 func (s *sessionStore) Snapshot() map[string]sessionState {
@@ -178,7 +145,6 @@ var persistedState = &statePersistence{
 	maxEntries: 1024,
 	maxAge:     24 * time.Hour,
 }
-var gzipSupport = &upstreamGzipSupport{unsupported: map[string]struct{}{}}
 var responsesHTTPClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -300,7 +266,6 @@ func loadRuntimeConfig() (*runtimeConfig, error) {
 	}
 
 	envFastMode := lookupBoolEnv("CLAUDE_PROXY_FAST_MODE")
-	envUpstreamGzip := lookupBoolEnv("CLAUDE_PROXY_UPSTREAM_GZIP")
 	fileFastMode := firstConfiguredBool(fileCfg.FastMode, fileCfg.Fastmode)
 	serviceTier := "priority"
 	switch {
@@ -318,7 +283,6 @@ func loadRuntimeConfig() (*runtimeConfig, error) {
 		LocalAuthToken:      firstNonEmpty(os.Getenv("CLAUDE_PROXY_LOCAL_AUTH_TOKEN"), fileCfg.LocalAuthToken, ""),
 		UpstreamBaseURL:     strings.TrimRight(firstNonEmpty(os.Getenv("CLAUDE_PROXY_UPSTREAM_BASE_URL"), fileCfg.UpstreamBaseURL, ""), "/"),
 		UpstreamToken:       firstNonEmpty(os.Getenv("CLAUDE_PROXY_UPSTREAM_TOKEN"), fileCfg.UpstreamToken, ""),
-		UpstreamGzip:        valueOrDefaultBool(envUpstreamGzip, fileCfg.UpstreamGzip),
 		FastMode:            isFastModeServiceTier(serviceTier),
 		ServiceTier:         serviceTier,
 		ReasoningEffort:     configuredReasoningEffort(firstNonEmpty(os.Getenv("CLAUDE_PROXY_REASONING_EFFORT"), fileCfg.ReasoningEffort, "xhigh")),
@@ -538,14 +502,6 @@ func cloneSessionState(value sessionState) sessionState {
 	return value
 }
 
-func envOrDefault(key, fallback string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-	return value
-}
-
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		value = strings.TrimSpace(value)
@@ -572,15 +528,6 @@ func firstConfiguredBool(values ...*bool) *bool {
 		}
 	}
 	return nil
-}
-
-func valueOrDefaultBool(values ...*bool) bool {
-	for _, value := range values {
-		if value != nil {
-			return *value
-		}
-	}
-	return false
 }
 
 func lookupBoolEnv(key string) *bool {
@@ -706,11 +653,6 @@ type upstreamRequest struct {
 	ReuseMode             string
 	EstimatedInput        int
 	CachedInputTokens     int
-	MessagesJSONBytes     int
-	InputJSONBytes        int
-	PrimaryBodyBytes      int
-	FallbackBodyBytes     int
-	BodyEncoding          string
 }
 
 func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]any) (*upstreamRequest, error) {
@@ -722,7 +664,6 @@ func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]a
 	messageHashes, totalMessageTokens := hashMessages(messages)
 	sessionID, stateKey, previous, hasPrevious, syntheticSession := resolveSessionState(r, body, promptCacheKey, messageHashes)
 	requestMessages := messages
-	previousResponseID := ""
 	cachedInputTokens := 0
 	reuseMode := "full_history"
 
@@ -733,23 +674,16 @@ func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]a
 
 	input := convertMessages(requestMessages)
 	instructions := systemText
-
 	reasoning := map[string]any{
 		"effort": configuredReasoningEffort(cfg.ReasoningEffort),
 	}
 
 	primary := map[string]any{
-		"model":             cfg.Model,
-		"input":             input,
-		"max_output_tokens": intValue(body["max_tokens"], 32000),
-		"reasoning":         reasoning,
-		"store":             false,
-		"stream":            true,
-		"prompt_cache_key":  promptCacheKey,
-		"tool_choice":       "auto",
-		"top_p":             0.98,
-		"text":              map[string]any{"verbosity": "low"},
-		"include":           []any{"reasoning.encrypted_content"},
+		"model":            cfg.Model,
+		"input":            input,
+		"reasoning":        reasoning,
+		"stream":           boolValue(body["stream"], true),
+		"prompt_cache_key": promptCacheKey,
 	}
 	if cfg.ServiceTier != "" {
 		primary["service_tier"] = cfg.ServiceTier
@@ -757,41 +691,26 @@ func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]a
 	if instructions != "" {
 		primary["instructions"] = instructions
 	}
+	if _, ok := body["max_tokens"]; ok {
+		primary["max_output_tokens"] = intValue(body["max_tokens"], 0)
+	}
 	if temperature, ok := body["temperature"].(float64); ok {
 		primary["temperature"] = temperature
-	} else {
-		primary["temperature"] = 1.0
+	}
+	if topP, ok := body["top_p"].(float64); ok {
+		primary["top_p"] = topP
 	}
 	if textConfig != nil {
 		primary["text"] = textConfig
 	}
 	if len(tools) > 0 {
 		primary["tools"] = tools
+	}
+	if _, ok := body["tool_choice"]; ok {
 		primary["tool_choice"] = mapToolChoice(body["tool_choice"])
 	}
 	fallback := cloneMap(primary)
 	delete(fallback, "service_tier")
-	messagesJSONBytes, err := jsonSizeBytes(messages)
-	if err != nil {
-		return nil, err
-	}
-	inputJSONBytes, err := jsonSizeBytes(input)
-	if err != nil {
-		return nil, err
-	}
-	useGzip := gzipSupport.Allowed(cfg.UpstreamBaseURL, cfg.UpstreamGzip)
-	primaryBodyBytes, err := requestBodyBytes(primary, useGzip)
-	if err != nil {
-		return nil, err
-	}
-	fallbackBodyBytes, err := requestBodyBytes(fallback, useGzip)
-	if err != nil {
-		return nil, err
-	}
-	bodyEncoding := "json"
-	if useGzip {
-		bodyEncoding = "gzip"
-	}
 
 	return &upstreamRequest{
 		Primary:               primary,
@@ -805,15 +724,10 @@ func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]a
 		TotalMessageTokens:    totalMessageTokens,
 		MessageCount:          len(messages),
 		AppendedMessages:      len(requestMessages),
-		PreviousResponseID:    previousResponseID,
+		PreviousResponseID:    "",
 		ReuseMode:             reuseMode,
 		EstimatedInput:        estimateStaticInputTokens(systemText, tools, textConfig) + totalMessageTokens,
 		CachedInputTokens:     cachedInputTokens,
-		MessagesJSONBytes:     messagesJSONBytes,
-		InputJSONBytes:        inputJSONBytes,
-		PrimaryBodyBytes:      primaryBodyBytes,
-		FallbackBodyBytes:     fallbackBodyBytes,
-		BodyEncoding:          bodyEncoding,
 	}, nil
 }
 
@@ -841,9 +755,8 @@ func sendUpstream(ctx context.Context, cfg *runtimeConfig, req *upstreamRequest)
 	}
 
 	var lastErr error
-	useGzip := gzipSupport.Allowed(cfg.UpstreamBaseURL, cfg.UpstreamGzip)
 	for _, attempt := range tryList {
-		result, err := performResponsesRequest(ctx, attempt.url, attempt.payload, headers, &useGzip, cfg.UpstreamBaseURL)
+		result, err := performResponsesRequest(ctx, attempt.url, attempt.payload, headers)
 		if err == nil {
 			return result, nil
 		}
@@ -859,8 +772,8 @@ func upstreamResponsesURL(base string) string {
 	return base + "/v1/responses"
 }
 
-func performResponsesRequest(ctx context.Context, url string, payload map[string]any, headers http.Header, useGzip *bool, gzipKey string) (map[string]any, error) {
-	response, err := openResponsesRequestWithFallback(ctx, url, payload, headers, useGzip, gzipKey)
+func performResponsesRequest(ctx context.Context, url string, payload map[string]any, headers http.Header) (map[string]any, error) {
+	response, err := openResponsesRequest(ctx, url, payload, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -869,26 +782,8 @@ func performResponsesRequest(ctx context.Context, url string, payload map[string
 	return collectResponses(response.Body)
 }
 
-func openResponsesRequestWithFallback(ctx context.Context, url string, payload map[string]any, headers http.Header, useGzip *bool, gzipKey string) (*http.Response, error) {
-	if useGzip != nil && *useGzip {
-		response, err := openResponsesRequest(ctx, url, payload, headers, true)
-		if err == nil {
-			return response, nil
-		}
-		if !shouldRetryPlainAfterGzip(err) {
-			return nil, err
-		}
-		if gzipSupport.MarkUnsupported(gzipKey) {
-			log.Printf("upstream gzip rejected, disabling gzip for %s until restart: %v", shortID(gzipKey), err)
-		}
-		*useGzip = false
-	}
-
-	return openResponsesRequest(ctx, url, payload, headers, false)
-}
-
-func openResponsesRequest(ctx context.Context, url string, payload map[string]any, headers http.Header, useGzip bool) (*http.Response, error) {
-	bodyBytes, err := marshalRequestBody(payload, useGzip)
+func openResponsesRequest(ctx context.Context, url string, payload map[string]any, headers http.Header) (*http.Response, error) {
+	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -898,9 +793,6 @@ func openResponsesRequest(ctx context.Context, url string, payload map[string]an
 		return nil, err
 	}
 	request.Header = headers.Clone()
-	if useGzip {
-		request.Header.Set("Content-Encoding", "gzip")
-	}
 
 	response, err := responsesHTTPClient.Do(request)
 	if err != nil {
@@ -910,75 +802,10 @@ func openResponsesRequest(ctx context.Context, url string, payload map[string]an
 	if response.StatusCode >= 400 {
 		raw, _ := io.ReadAll(response.Body)
 		_ = response.Body.Close()
-		return nil, &upstreamHTTPError{StatusCode: response.StatusCode, Body: string(raw)}
+		return nil, fmt.Errorf("upstream %d: %s", response.StatusCode, string(raw))
 	}
 
 	return response, nil
-}
-
-type upstreamHTTPError struct {
-	StatusCode int
-	Body       string
-}
-
-func (e *upstreamHTTPError) Error() string {
-	return fmt.Sprintf("upstream %d: %s", e.StatusCode, e.Body)
-}
-
-func marshalRequestBody(payload map[string]any, useGzip bool) ([]byte, error) {
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-	if !useGzip {
-		return bodyBytes, nil
-	}
-
-	var compressed bytes.Buffer
-	writer := gzip.NewWriter(&compressed)
-	if _, err := writer.Write(bodyBytes); err != nil {
-		_ = writer.Close()
-		return nil, err
-	}
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-	return compressed.Bytes(), nil
-}
-
-func jsonSizeBytes(value any) (int, error) {
-	bodyBytes, err := json.Marshal(value)
-	if err != nil {
-		return 0, err
-	}
-	return len(bodyBytes), nil
-}
-
-func requestBodyBytes(payload map[string]any, useGzip bool) (int, error) {
-	bodyBytes, err := marshalRequestBody(payload, useGzip)
-	if err != nil {
-		return 0, err
-	}
-	return len(bodyBytes), nil
-}
-
-func shouldRetryPlainAfterGzip(err error) bool {
-	var upstreamErr *upstreamHTTPError
-	if !errors.As(err, &upstreamErr) {
-		return false
-	}
-	if upstreamErr.StatusCode == http.StatusUnsupportedMediaType {
-		return true
-	}
-	if upstreamErr.StatusCode != http.StatusBadRequest {
-		return false
-	}
-
-	body := strings.ToLower(strings.TrimSpace(upstreamErr.Body))
-	return strings.Contains(body, "failed to parse request body") ||
-		strings.Contains(body, "content-encoding") ||
-		strings.Contains(body, "unsupported encoding") ||
-		strings.Contains(body, "unsupported media type")
 }
 
 func collectResponses(body io.Reader) (map[string]any, error) {
@@ -1053,9 +880,8 @@ func streamUpstreamToAnthropic(ctx context.Context, cfg *runtimeConfig, req *ups
 	}
 
 	var lastErr error
-	useGzip := gzipSupport.Allowed(cfg.UpstreamBaseURL, cfg.UpstreamGzip)
 	for _, attempt := range tryList {
-		response, err := openResponsesRequestWithFallback(ctx, attempt.url, attempt.payload, headers, &useGzip, cfg.UpstreamBaseURL)
+		response, err := openResponsesRequest(ctx, attempt.url, attempt.payload, headers)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1107,8 +933,8 @@ func translateToAnthropic(response map[string]any, requestedModel string) map[st
 			}
 			content = append(content, map[string]any{
 				"type":  "tool_use",
-				"id":    stringValue(itemMap["call_id"], stringValue(itemMap["id"], "")),
-				"name":  stringValue(itemMap["name"], ""),
+				"id":    normalizeToolCallID(stringValue(itemMap["call_id"], stringValue(itemMap["id"], ""))),
+				"name":  normalizeToolName(stringValue(itemMap["name"], "")),
 				"input": input,
 			})
 			stopReason = "tool_use"
@@ -1180,13 +1006,14 @@ func writeAnthropicSSE(w http.ResponseWriter, response map[string]any) {
 				"index": index,
 			})
 		case "tool_use":
+			toolID := normalizeToolCallID(stringValue(block["id"], ""))
 			send("content_block_start", map[string]any{
 				"type":  "content_block_start",
 				"index": index,
 				"content_block": map[string]any{
 					"type":  "tool_use",
-					"id":    stringValue(block["id"], ""),
-					"name":  stringValue(block["name"], ""),
+					"id":    toolID,
+					"name":  normalizeToolName(stringValue(block["name"], "")),
 					"input": map[string]any{},
 				},
 			})
@@ -1449,10 +1276,10 @@ func (s *anthropicStreamWriter) appendTextDelta(key, messageID, delta string) {
 func (s *anthropicStreamWriter) ensureToolBlock(key, messageID, callID, name string) int {
 	s.startMessage(messageID)
 	if callID != "" {
-		s.toolCallIDs[key] = callID
+		s.toolCallIDs[key] = normalizeToolCallID(callID)
 	}
 	if name != "" {
-		s.toolNames[key] = name
+		s.toolNames[key] = normalizeToolName(name)
 	}
 	if index, ok := s.blockIndexes[key]; ok {
 		return index
@@ -1701,103 +1528,107 @@ func convertMessages(messages []any) []any {
 }
 
 func convertMessage(message map[string]any) []any {
-	role := stringValue(message["role"], "")
+	role := stringValue(message["role"], "user")
 	content := message["content"]
 	out := make([]any, 0)
 
-	switch role {
-	case "user":
-		parts := toInputTextParts(content)
-		if len(parts) > 0 {
-			out = append(out, map[string]any{
-				"type":    "message",
-				"role":    "user",
-				"content": parts,
-			})
+	switch value := content.(type) {
+	case string:
+		if value == "" {
+			return nil
 		}
-		for _, blockValue := range anySlice(content) {
-			block, ok := blockValue.(map[string]any)
-			if !ok || stringValue(block["type"], "") != "tool_result" {
-				continue
-			}
-			output := ""
-			switch blockContent := block["content"].(type) {
-			case string:
-				output = blockContent
-			default:
-				output = marshalString(block["content"])
+		return []any{map[string]any{
+			"role": role,
+			"content": []any{map[string]any{
+				"type": messageContentType(role),
+				"text": value,
+			}},
+		}}
+	case []any:
+		messageContent := make([]any, 0)
+		flushMessage := func() {
+			if len(messageContent) == 0 {
+				return
 			}
 			out = append(out, map[string]any{
-				"type":    "function_call_output",
-				"call_id": stringValue(block["tool_use_id"], ""),
-				"output":  output,
+				"role":    role,
+				"content": append([]any(nil), messageContent...),
 			})
+			messageContent = messageContent[:0]
 		}
-	case "assistant":
-		textParts := make([]any, 0)
-		for _, blockValue := range anySlice(content) {
+		for _, blockValue := range value {
 			block, ok := blockValue.(map[string]any)
 			if !ok {
 				continue
 			}
 			switch stringValue(block["type"], "") {
 			case "text":
-				textParts = append(textParts, map[string]any{
-					"type": "output_text",
-					"text": stringValue(block["text"], ""),
+				text := stringValue(block["text"], "")
+				if text == "" {
+					continue
+				}
+				messageContent = append(messageContent, map[string]any{
+					"type": messageContentType(role),
+					"text": text,
 				})
-			case "thinking":
-				textParts = append(textParts, map[string]any{
-					"type": "output_text",
-					"text": stringValue(block["thinking"], ""),
+			case "image":
+				source, ok := block["source"].(map[string]any)
+				if !ok {
+					continue
+				}
+				data := stringValue(source["data"], "")
+				if data == "" {
+					continue
+				}
+				messageContent = append(messageContent, map[string]any{
+					"type":      "input_image",
+					"image_url": fmt.Sprintf("data:%s;base64,%s", stringValue(source["media_type"], "image/png"), data),
 				})
 			case "tool_use":
+				flushMessage()
 				out = append(out, map[string]any{
 					"type":      "function_call",
-					"call_id":   stringValue(block["id"], ""),
-					"name":      stringValue(block["name"], ""),
+					"call_id":   normalizeToolCallID(stringValue(block["id"], "")),
+					"name":      normalizeToolName(stringValue(block["name"], "")),
 					"arguments": marshalString(block["input"]),
 				})
+			case "tool_result":
+				flushMessage()
+				output := ""
+				switch blockContent := block["content"].(type) {
+				case string:
+					output = blockContent
+				default:
+					output = marshalString(block["content"])
+				}
+				out = append(out, map[string]any{
+					"type":    "function_call_output",
+					"call_id": normalizeToolCallID(stringValue(block["tool_use_id"], "")),
+					"output":  output,
+				})
+			case "thinking":
+				// Match cc-switch custom openai_responses transform and drop thinking blocks.
 			}
 		}
-		if len(textParts) > 0 {
-			out = append(out, map[string]any{
-				"type":    "message",
-				"role":    "assistant",
-				"content": textParts,
-			})
-		}
+		flushMessage()
+	default:
+		return []any{map[string]any{"role": role}}
 	}
 
 	return out
 }
 
-func toInputTextParts(content any) []any {
-	switch value := content.(type) {
-	case string:
-		if value == "" {
-			return nil
-		}
-		return []any{map[string]any{"type": "input_text", "text": value}}
-	case []any:
-		out := make([]any, 0, len(value))
-		for _, blockValue := range value {
-			block, ok := blockValue.(map[string]any)
-			if !ok || stringValue(block["type"], "") != "text" {
-				continue
-			}
-			out = append(out, map[string]any{
-				"type": "input_text",
-				"text": stringValue(block["text"], ""),
-			})
-		}
-		return out
-	default:
-		return nil
+func messageContentType(role string) string {
+	if role == "assistant" {
+		return "output_text"
 	}
+	return "input_text"
 }
 
 func mapToolChoice(toolChoice any) any {
+	if choice, ok := toolChoice.(string); ok && strings.TrimSpace(choice) != "" {
+		return choice
+	}
 	choice, ok := toolChoice.(map[string]any)
 	if !ok {
 		return "auto"
@@ -1805,6 +1636,8 @@ func mapToolChoice(toolChoice any) any {
 	switch stringValue(choice["type"], "") {
 	case "any":
 		return "required"
+	case "auto", "none":
+		return stringValue(choice["type"], "auto")
 	case "tool":
 		name := stringValue(choice["name"], "")
 		if name != "" {
@@ -1887,6 +1720,9 @@ func claudeSettingsModel(contextWindowLength int) string {
 }
 
 func buildPromptCacheKey(cacheID, model, instructions string, tools []any, textConfig map[string]any) string {
+	if strings.TrimSpace(cacheID) != "" {
+		return cacheID
+	}
 	sum := sha256Hex(stableJSON(map[string]any{
 		"cache_id":     cacheID,
 		"model":        model,
@@ -1895,6 +1731,22 @@ func buildPromptCacheKey(cacheID, model, instructions string, tools []any, textC
 		"text":         textConfig,
 	}))
 	return "claude-gpt54-" + sum[:32]
+}
+
+func normalizeToolCallID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) <= 64 {
+		return value
+	}
+	return "call_" + sha256Hex(value)[:59]
+}
+
+func normalizeToolName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown_tool"
+	}
+	return value
 }
 
 func storeSessionState(built *upstreamRequest, completed map[string]any) {
@@ -1922,12 +1774,8 @@ func logTurnStart(mode, requestedModel string, req *upstreamRequest) {
 	if req == nil {
 		return
 	}
-	bodyLabel := "raw"
-	if req.BodyEncoding == "gzip" {
-		bodyLabel = "compressed"
-	}
 	log.Printf(
-		"turn_start mode=%s model=%s session=%s synthetic=%t prompt_cache=%s reuse=%s messages=%d appended=%d prev_response=%s estimated_input=%d cached_input=%d %s=%s",
+		"turn_start mode=%s model=%s session=%s synthetic=%t prompt_cache=%s reuse=%s messages=%d appended=%d prev_response=%s estimated_input=%d cached_input=%d",
 		mode,
 		requestedModel,
 		shortID(req.SessionID),
@@ -1939,8 +1787,6 @@ func logTurnStart(mode, requestedModel string, req *upstreamRequest) {
 		shortID(req.PreviousResponseID),
 		req.EstimatedInput,
 		req.CachedInputTokens,
-		bodyLabel,
-		byteSizeLabel(req.PrimaryBodyBytes),
 	)
 }
 
@@ -2049,23 +1895,6 @@ func approximateTokens(payload any) int {
 	return len(stableJSON(payload)) / 4
 }
 
-func byteSizeLabel(size int) string {
-	if size < 1024 {
-		return fmt.Sprintf("%.2fKB", float64(size)/1024)
-	}
-
-	value := float64(size)
-	units := []string{"KB", "MB", "GB"}
-	for _, unit := range units {
-		value /= 1024
-		if value < 1024 || unit == units[len(units)-1] {
-			return fmt.Sprintf("%.2f%s", value, unit)
-		}
-	}
-
-	return fmt.Sprintf("%.2fGB", float64(size)/(1024*1024*1024))
-}
-
 func estimateStaticInputTokens(instructions string, tools []any, textConfig map[string]any) int {
 	staticInput := map[string]any{}
 	if instructions != "" {
@@ -2124,18 +1953,6 @@ func intValue(value any, fallback int) int {
 	case string:
 		if i, err := strconv.Atoi(v); err == nil {
 			return i
-		}
-	}
-	return fallback
-}
-
-func floatValue(value any, fallback float64) float64 {
-	switch v := value.(type) {
-	case float64:
-		return v
-	case json.Number:
-		if f, err := v.Float64(); err == nil {
-			return f
 		}
 	}
 	return fallback
@@ -2286,11 +2103,4 @@ func sha256Hex(input string) string {
 func marshalString(value any) string {
 	data, _ := json.Marshal(value)
 	return string(data)
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
