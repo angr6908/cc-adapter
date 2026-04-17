@@ -10,7 +10,6 @@ GPT (OpenAI API) adapter for Claude Code, featuring a standalone Go binary exper
 - Advanced Prompt Caching (enabled by default)
 - High-Efficiency Streaming and SSE (enabled by default)
 - Session Retention (enabled by default)
-- Gzip Compression (enabled by default with fallback)
 
 ## Config
 
