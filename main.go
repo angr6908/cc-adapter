@@ -707,7 +707,9 @@ func buildUpstreamRequest(cfg *runtimeConfig, r *http.Request, body map[string]a
 		primary["tools"] = tools
 	}
 	if _, ok := body["tool_choice"]; ok {
-		primary["tool_choice"] = mapToolChoice(body["tool_choice"])
+		if toolChoice, ok := mapToolChoice(body["tool_choice"], tools); ok {
+			primary["tool_choice"] = toolChoice
+		}
 	}
 	fallback := cloneMap(primary)
 	delete(fallback, "service_tier")
@@ -1625,26 +1627,113 @@ func messageContentType(role string) string {
 	return "input_text"
 }
 
-func mapToolChoice(toolChoice any) any {
-	if choice, ok := toolChoice.(string); ok && strings.TrimSpace(choice) != "" {
-		return choice
+func mapToolChoice(toolChoice any, tools []any) (any, bool) {
+	toolNames := mappedToolNames(tools)
+
+	switch choice := toolChoice.(type) {
+	case string:
+		return mapStringToolChoice(choice, toolNames)
+	case map[string]any:
+		return mapObjectToolChoice(choice, toolNames)
+	default:
+		if len(toolNames) == 0 {
+			return nil, false
+		}
+		return "auto", true
 	}
-	choice, ok := toolChoice.(map[string]any)
-	if !ok {
-		return "auto"
+}
+
+func mapStringToolChoice(choice string, toolNames map[string]string) (any, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(choice))
+	switch normalized {
+	case "":
+		if len(toolNames) == 0 {
+			return nil, false
+		}
+		return "auto", true
+	case "none":
+		return "none", true
+	case "auto":
+		if len(toolNames) == 0 {
+			return nil, false
+		}
+		return "auto", true
+	case "any", "required", "function", "tool":
+		if len(toolNames) == 0 {
+			return nil, false
+		}
+		return "required", true
+	default:
+		if name, ok := resolveMappedToolName(choice, toolNames); ok {
+			return map[string]any{"type": "function", "name": name}, true
+		}
+		if len(toolNames) == 0 {
+			return nil, false
+		}
+		return "auto", true
 	}
-	switch stringValue(choice["type"], "") {
-	case "any":
-		return "required"
-	case "auto", "none":
-		return stringValue(choice["type"], "auto")
+}
+
+func mapObjectToolChoice(choice map[string]any, toolNames map[string]string) (any, bool) {
+	choiceType := strings.ToLower(strings.TrimSpace(stringValue(choice["type"], "")))
+	switch choiceType {
+	case "", "function":
+		name := stringValue(choice["name"], "")
+		if function, ok := choice["function"].(map[string]any); ok && name == "" {
+			name = stringValue(function["name"], "")
+		}
+		if name != "" {
+			if resolved, ok := resolveMappedToolName(name, toolNames); ok {
+				return map[string]any{"type": "function", "name": resolved}, true
+			}
+		}
 	case "tool":
 		name := stringValue(choice["name"], "")
-		if name != "" {
-			return map[string]any{"type": "function", "name": name}
+		if resolved, ok := resolveMappedToolName(name, toolNames); ok {
+			return map[string]any{"type": "function", "name": resolved}, true
 		}
+	case "any", "required":
+		if len(toolNames) == 0 {
+			return nil, false
+		}
+		return "required", true
+	case "auto":
+		if len(toolNames) == 0 {
+			return nil, false
+		}
+		return "auto", true
+	case "none":
+		return "none", true
 	}
-	return "auto"
+
+	if len(toolNames) == 0 {
+		return nil, false
+	}
+	return "auto", true
+}
+
+func mappedToolNames(tools []any) map[string]string {
+	names := make(map[string]string, len(tools))
+	for _, toolValue := range tools {
+		tool, ok := toolValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := stringValue(tool["name"], "")
+		if name == "" {
+			continue
+		}
+		names[strings.ToLower(name)] = name
+	}
+	return names
+}
+
+func resolveMappedToolName(name string, toolNames map[string]string) (string, bool) {
+	if len(toolNames) == 0 {
+		return "", false
+	}
+	resolved, ok := toolNames[strings.ToLower(strings.TrimSpace(name))]
+	return resolved, ok
 }
 
 func mapTextConfig(outputConfig any) map[string]any {
