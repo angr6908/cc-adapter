@@ -150,10 +150,10 @@ var responsesHTTPClient = &http.Client{
 		Proxy:                 http.ProxyFromEnvironment,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       300 * time.Second,
+		TLSHandshakeTimeout:   300 * time.Second,
+		ExpectContinueTimeout: 300 * time.Second,
+		ResponseHeaderTimeout: 300 * time.Second,
 	},
 }
 
@@ -170,7 +170,7 @@ func main() {
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           newHandler(cfg),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: 300 * time.Second,
 	}
 
 	log.Printf("cc-adapter listening on http://%s", addr)
